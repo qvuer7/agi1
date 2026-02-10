@@ -59,6 +59,16 @@ class OpenRouterClient:
 
         if tools:
             payload["tools"] = tools
+            # Note: Some Gemini models have issues with tool calling via OpenRouter
+            # If you get "Thought signature is not valid" error, try:
+            # - Use a different model (e.g., anthropic/claude-3.5-sonnet, openai/gpt-4o-mini)
+            # - Or use gemini-pro instead of gemini-2.0-flash
+            if "gemini" in self.model.lower():
+                logger.warning(
+                    f"Using Gemini model ({self.model}) with tools. "
+                    "If you get 'Thought signature is not valid' error, "
+                    "consider switching to a model that better supports tool calling."
+                )
 
         try:
             response = self.client.post("/chat/completions", json=payload)

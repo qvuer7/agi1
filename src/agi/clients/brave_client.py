@@ -1,5 +1,6 @@
 """Brave Search API client."""
 
+import time
 import httpx
 from typing import Dict, List, Optional
 
@@ -48,8 +49,26 @@ class BraveClient:
                 "q": query,
                 "count": count,
             }
-            response = self.client.get("/web/search", params=params)
-            response.raise_for_status()
+            
+            # Retry with exponential backoff for 429 errors
+            max_retries = 3
+            base_delay = 1.0
+            
+            for attempt in range(max_retries):
+                response = self.client.get("/web/search", params=params)
+                
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"Brave API rate limited (429), retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        response.raise_for_status()
+                else:
+                    response.raise_for_status()
+                    break
+            
             data = response.json()
 
             results = []

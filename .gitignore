@@ -10,3 +10,6 @@ wheels/
 .venv
 .env
 .env.example
+.val
+.db
+.lock
