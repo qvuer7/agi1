@@ -125,9 +125,16 @@ class AgentLoop:
                 # Final answer
                 answer = assistant_message.get("content", "")
                 logger.info(f"Agent completed with final answer ({len(answer)} chars)")
+
+                # Final URL correctness gate - verify all product URLs before returning
+                verified_urls = self._verify_product_urls(verified_urls, fetched_urls, max_pages_fetched)
+
+                # Sanitize output so the answer includes only verified links
+                answer = self._sanitize_output(answer, verified_urls)
+
                 return {
                     "answer": answer,
-                    "sources": sources,
+                    "sources": self._get_verified_sources_only(verified_urls),
                     "debug": debug_traces,
                 }
 
@@ -786,4 +793,3 @@ class AgentLoop:
             corrected_urls[url] = metadata
         
         return corrected_urls
-
