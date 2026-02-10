@@ -136,13 +136,14 @@ def _has_product_signals(html: str, text: str) -> bool:
 def _extract_product_candidate_links(html: str, base_url: str) -> List[str]:
     """
     Extract product candidate links from listing pages (DOM-based, not guessed).
+    Uses strict allowlist patterns to ensure only product detail URLs are returned.
     
     Args:
         html: HTML content
         base_url: Base URL for resolving relative links
         
     Returns:
-        List of absolute product candidate URLs
+        List of absolute product candidate URLs that match strict allowlist patterns
     """
     candidates = []
     if not html:
@@ -150,16 +151,38 @@ def _extract_product_candidate_links(html: str, base_url: str) -> List[str]:
     
     try:
         soup = BeautifulSoup(html, "lxml")
+        parsed_base = urlparse(base_url)
+        base_domain = parsed_base.netloc.lower()
         
-        # Product link patterns (heuristic but deterministic)
-        product_link_patterns = [
-            r"/product/",
-            r"/p/",
-            r"/item/",
-            r"/detail/",
-            r"/buy/",
-            r"-\d+\.html",
-            r"/\d+$",  # URL ending in numbers
+        # STRICT ALLOWLIST: Site-specific product URL patterns
+        # These patterns must match for a URL to be considered a product candidate
+        strict_allowlist_patterns = [
+            # auto.ria.com patterns
+            r"/auto_[^/]+\.html$",  # /auto_bmw_5_series_39462080.html
+            r"/auto_[^/]+/\d+\.html$",  # /auto_bmw/39462080.html
+            
+            # Generic e-commerce patterns (strict)
+            r"/product/[^/]+/\d+",  # /product/item-name/12345
+            r"/p/[^/]+",  # /p/product-slug
+            r"/item/\d+",  # /item/12345
+            r"/detail/\d+",  # /detail/12345
+            r"/products/[^/]+",  # /products/product-slug
+            
+            # Pattern: URL ending with numeric ID (but not listing pages)
+            r"/\d{6,}$",  # At least 6 digits (common for product IDs)
+        ]
+        
+        # BLOCKLIST: Patterns that indicate listing/category pages (must NOT match)
+        blocklist_patterns = [
+            r"/search",
+            r"/category",
+            r"/catalog",
+            r"/filter",
+            r"/all",
+            r"/list",
+            r"/results",
+            r"/car/[^/]+$",  # /car/bmw/5-series (listing, not product)
+            r"/car/[^/]+/[^/]+$",  # /car/bmw/5-series/f10 (listing, not product)
         ]
         
         # Look for links in product containers
@@ -182,44 +205,45 @@ def _extract_product_candidate_links(html: str, base_url: str) -> List[str]:
             absolute_url = urljoin(base_url, href)
             parsed = urlparse(absolute_url)
             
-            # Only keep http/https URLs
+            # Only keep http/https URLs on same domain
             if parsed.scheme not in ("http", "https"):
                 continue
             
-            href_lower = href.lower()
-            link_text = link.get_text(strip=True).lower()
+            # Must be on same domain (no cross-domain links)
+            if parsed.netloc.lower() != base_domain:
+                continue
             
-            # Check if link is in a product container
+            path_lower = parsed.path.lower()
+            
+            # STRICT CHECK: Must match allowlist pattern
+            matches_allowlist = any(re.search(pattern, path_lower) for pattern in strict_allowlist_patterns)
+            
+            # STRICT CHECK: Must NOT match blocklist patterns
+            matches_blocklist = any(re.search(pattern, path_lower) for pattern in blocklist_patterns)
+            
+            if not matches_allowlist or matches_blocklist:
+                continue
+            
+            # Additional validation: Check if link is in a product container (optional, but helps)
             in_product_container = False
             parent = link.parent
             for _ in range(3):  # Check up to 3 levels up
                 if parent and parent.name:
                     parent_classes = " ".join(parent.get("class", [])).lower()
-                    if any(keyword in parent_classes for keyword in ["product", "item", "card", "goods"]):
+                    if any(keyword in parent_classes for keyword in ["product", "item", "card", "goods", "auto"]):
                         in_product_container = True
                         break
                 parent = getattr(parent, "parent", None)
             
-            # Pattern matching
-            matches_pattern = any(re.search(pattern, href_lower) for pattern in product_link_patterns)
+            # Normalize URL (remove fragment, clean tracking params)
+            normalized = clean_url(absolute_url, remove_tracking=True)
             
-            # Check for product-like classes on link
-            link_classes = " ".join(link.get("class", [])).lower()
-            has_product_class = any(keyword in link_classes for keyword in ["product", "item", "card"])
-            
-            # Check for price in link text
-            has_price = bool(re.search(r"[\d,]+\.?\d*\s*(usd|eur|bgn|uah|rub|₴|€|$|£)", link_text))
-            
-            # If matches any criteria, add as candidate
-            if matches_pattern or in_product_container or has_product_class or has_price:
-                # Normalize URL (remove fragment, clean tracking params, but keep important params like q=)
-                normalized = clean_url(absolute_url, remove_tracking=True)
-                
-                if normalized not in seen_urls:
-                    seen_urls.add(normalized)
-                    candidates.append(normalized)
+            if normalized not in seen_urls:
+                seen_urls.add(normalized)
+                candidates.append(normalized)
         
         # Limit to reasonable number
+        logger.debug(f"Extracted {len(candidates)} product candidate links (strict allowlist) from {base_url}")
         return candidates[:50]
     
     except Exception as e:

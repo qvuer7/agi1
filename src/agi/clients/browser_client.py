@@ -25,16 +25,24 @@ class BrowserClient:
     """Client for rendering web pages with Playwright."""
 
     def __init__(self):
-        self.playwright = None
-        self.browser: Optional[Browser] = None
-        self._initialized = False
+        # Don't initialize Playwright here - it must be done in the same thread that uses it
+        self._playwright_context = None
+        self._browser_context = None
 
-    def _ensure_initialized(self):
-        """Initialize Playwright and browser if not already done."""
-        if not self._initialized:
-            self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.launch(headless=BROWSER_HEADLESS)
-            self._initialized = True
+    def _get_browser_in_thread(self):
+        """
+        Get or create browser instance in the current thread.
+        Playwright sync API requires browser to be created and used in the same thread.
+        """
+        # Use thread-local storage to ensure each thread has its own browser instance
+        import threading
+        thread_id = threading.current_thread().ident
+        
+        # For now, create a new browser for each render to avoid thread issues
+        # This is less efficient but more reliable
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=BROWSER_HEADLESS)
+        return playwright, browser
 
     def _render_sync(self, url: str) -> Dict[str, str]:
         """
@@ -49,13 +57,12 @@ class BrowserClient:
         start_time = time.time()
         logger.info(f"[RENDER] Starting render of {url}")
         
-        self._ensure_initialized()
-
-        if not self.browser:
-            raise RuntimeError("Browser not initialized")
-
+        # Get browser instance in this thread (creates new one if needed)
+        playwright, browser = self._get_browser_in_thread()
+        page = None
+        
         try:
-            page: Page = self.browser.new_page()
+            page = browser.new_page()
             logger.debug(f"[RENDER] Created new page for {url}")
             # Set a more reasonable default timeout
             page.set_default_timeout(BROWSER_TIMEOUT)
@@ -150,7 +157,10 @@ class BrowserClient:
             product_candidates = classification.get("product_candidate_links", [])
             logger.debug(f"[RENDER] Classified {url} as {classification['verdict']} with {len(product_candidates)} product candidates (took {classify_time:.0f}ms)")
 
-            page.close()
+            if page:
+                page.close()
+            browser.close()
+            playwright.stop()
             
             total_time = (time.time() - start_time) * 1000
             status_msg = "fully loaded" if navigation_success else "partial content (timeout)"
@@ -168,23 +178,39 @@ class BrowserClient:
             total_time = (time.time() - start_time) * 1000
             logger.warning(f"[RENDER] Timeout rendering {url}: {e} (total time: {total_time:.0f}ms)")
             # Try to get partial content even on timeout
+            html = ""
+            text = ""
             try:
-                if 'page' in locals() and page:
+                if page:
                     html = page.content()
                     text = page.inner_text("body") if page.query_selector("body") else ""
                     if html and len(html) > 100:  # If we got some content, use it
                         logger.info(f"[RENDER] Got partial content for {url} despite timeout ({len(html)} bytes)")
                         extracted_links = extract_links(html, url)
                         classification = classify_page(html, text, url)
-                        page.close()
+                        if page:
+                            page.close()
+                        browser.close()
+                        playwright.stop()
                         return {
                             "html": html,
                             "text": text,
                             "extracted_links": extracted_links,
                             "classification": classification,
+                            "final_url": url,
+                            "canonical_url": None,
                         }
             except Exception as partial_error:
                 logger.debug(f"[RENDER] Could not get partial content: {partial_error}")
+            finally:
+                # Cleanup browser and playwright
+                try:
+                    if page:
+                        page.close()
+                    browser.close()
+                    playwright.stop()
+                except Exception:
+                    pass
             
             return {
                 "html": "",
@@ -202,6 +228,14 @@ class BrowserClient:
         except Exception as e:
             total_time = (time.time() - start_time) * 1000
             logger.error(f"[RENDER] Error rendering {url}: {e} (total time: {total_time:.0f}ms)", exc_info=True)
+            # Cleanup browser and playwright on error
+            try:
+                if page:
+                    page.close()
+                browser.close()
+                playwright.stop()
+            except Exception:
+                pass
             return {
                 "html": "",
                 "text": "",
@@ -253,12 +287,11 @@ class BrowserClient:
 
     def close(self):
         """Close browser and cleanup."""
-        if self.browser:
-            self.browser.close()
-        if self.playwright:
-            self.playwright.stop()
-        self._initialized = False
+        # Browser instances are now created per-thread and cleaned up after each render
+        # No persistent browser to close
+        pass
 
     def __del__(self):
         """Cleanup on deletion."""
-        self.close()
+        # No cleanup needed - browsers are cleaned up after each render
+        pass
