@@ -1,0 +1,503 @@
+AGI-1 AGENT WORKFLOW - PURE TEXT VERSION
+==========================================
+
+This document describes how the LLM agent makes decisions, what tools it can use, and how context flows through the system.
+
+================================================================================
+1. AGENT INITIALIZATION AND SYSTEM PROMPT
+================================================================================
+
+When a user sends a request to /browse endpoint, the agent is initialized with a system prompt that defines its behavior.
+
+Location: src/agi/agent/agent_loop.py lines 54-78
+
+SYSTEM PROMPT CONTENT:
+-----------------------
+"You are a reliable web browsing and product research assistant. Use the available tools to search the web and fetch pages. Prefer search_web + fetch_url. Use render_url only if fetch_url fails or returns empty content.
+
+CRITICAL LINK VALIDATION RULES: 
+Never trust URLs from search results directly. 
+Before showing ANY product link to the user, you MUST successfully visit it using fetch_url or render_url. 
+If a link returns 403, 404, timeout, empty content, or redirects to a generic page, discard it. 
+Never hallucinate or guess URL structures based on patterns. 
+If you have not successfully reached the page in this session, the link is UNVERIFIED and must not be shown. 
+If a direct product page cannot be verified, fallback to a category or filtered search page on the same domain.
+
+OUTPUT RULES: 
+Only cite URLs that you have personally verified via tools in this session. 
+If no verified product link is available, explicitly say that no verified listing was found. 
+Do not invent links under any circumstances.
+
+Failure to follow these rules is considered an incorrect response.
+
+Be concise but thorough. 
+If a search does not yield good results, refine the query and try again."
+
+INITIAL MESSAGE STRUCTURE:
+--------------------------
+The agent starts with two messages:
+1. System message: Contains the prompt above
+2. User message: Contains the actual user query/prompt
+
+This message array grows as the agent interacts with tools.
+
+================================================================================
+2. AVAILABLE TOOLS (WHAT THE LLM CAN CALL)
+================================================================================
+
+The LLM has access to exactly 3 tools, defined in src/agi/agent/tool_schemas.py lines 3-62.
+
+TOOL 1: search_web
+------------------
+Function name: search_web
+Description: "Search the web for information. Use this first to find relevant URLs."
+Parameters:
+  - query (string, required): Search query string
+  - count (integer, optional, default=5, min=1, max=10): Number of results to return
+
+What it does:
+  - Calls Brave Search API at https://api.search.brave.com/res/v1/web/search
+  - Returns list of search results with title, URL, and snippet
+  - Results are cached for 1 day
+  - Implementation: src/agi/agent/agent_loop.py lines 202-235
+  - Client code: src/agi/clients/brave_client.py lines 30-73
+
+TOOL 2: fetch_url
+-----------------
+Function name: fetch_url
+Description: "Fetch and extract text content from a URL. Use this after search_web to get page content."
+Parameters:
+  - url (string, required): URL to fetch
+
+What it does:
+  - Makes HTTP GET request using httpx library
+  - Extracts HTML content from the page
+  - Extracts title from HTML <title> tag
+  - Converts HTML to readable text using trafilatura (or BeautifulSoup fallback)
+  - Truncates text to 20,000 characters
+  - Results are cached for 7 days
+  - Implementation: src/agi/agent/agent_loop.py lines 237-280
+  - Client code: src/agi/clients/fetch_client.py lines 24-108
+  - Text extraction: src/agi/extract/html_extract.py lines 13-54
+
+TOOL 3: render_url
+------------------
+Function name: render_url
+Description: "Render a URL using a browser (for JavaScript-heavy pages). Only use if fetch_url fails or returns empty content."
+Parameters:
+  - url (string, required): URL to render
+
+What it does:
+  - Uses Playwright to launch headless Chromium browser
+  - Navigates to URL and waits for network idle
+  - Extracts HTML and text content from rendered page
+  - Results are cached for 7 days
+  - Implementation: src/agi/agent/agent_loop.py lines 282-319
+  - Client code: src/agi/clients/browser_client.py lines 31-116
+  - Note: Runs in thread pool to avoid asyncio conflicts with FastAPI
+
+================================================================================
+3. AGENT DECISION LOOP (HOW THE LLM IS PROMPTED EACH STEP)
+================================================================================
+
+The agent runs in a loop for up to max_steps iterations (default: 10).
+
+Location: src/agi/agent/agent_loop.py lines 73-154
+
+STEP-BY-STEP PROCESS:
+---------------------
+
+STEP 1: CALL LLM WITH CURRENT CONTEXT
+--------------------------------------
+Location: src/agi/agent/agent_loop.py line 78
+
+The agent calls OpenRouter API with:
+  - All accumulated messages (system prompt + user query + all previous tool calls and results)
+  - Tool definitions (the 3 tools described above)
+  - Model specified in config (default: google/gemini-2.0-flash)
+
+OpenRouter Client: src/agi/clients/openrouter_client.py lines 35-80
+  - Endpoint: https://openrouter.ai/api/v1/chat/completions
+  - Method: POST
+  - Headers: Authorization Bearer token, Content-Type application/json
+  - Payload includes: model, messages array, tools array
+
+The LLM receives the full conversation history and must decide:
+  - Should I call a tool? (if yes, which one and with what parameters)
+  - Or should I provide a final answer?
+
+STEP 2: LLM RESPONSE PROCESSING
+--------------------------------
+Location: src/agi/agent/agent_loop.py lines 88-96
+
+The LLM response contains either:
+  A) A final answer (no tool_calls field or empty tool_calls)
+     - This means the LLM thinks it has enough information
+     - The answer is extracted from message.content
+     - Agent returns immediately with answer and sources
+
+  B) Tool calls (tool_calls field with one or more tool invocations)
+     - Each tool call has: function name, arguments (JSON string), unique ID
+     - Agent must execute these tools before continuing
+
+STEP 3: EXECUTE TOOL CALLS
+---------------------------
+Location: src/agi/agent/agent_loop.py lines 101-146
+
+For each tool call in the LLM response:
+
+  3a. Parse tool arguments
+      - Arguments come as JSON string from LLM
+      - Parsed into Python dict
+      - Location: src/agi/agent/agent_loop.py lines 106-111
+
+  3b. Execute the tool
+      - Calls AgentLoop._execute_tool() with function name and arguments
+      - Location: src/agi/agent/agent_loop.py line 116
+      - Implementation: src/agi/agent/agent_loop.py lines 194-325
+      
+      The tool execution:
+      - Checks cache first (if cached, returns immediately)
+      - If not cached, calls the actual API/client
+      - Formats result into text for LLM
+      - Caches the result
+      - Returns dict with: content (text for LLM), success, url, title
+
+  3c. Add tool result to message history
+      - Creates a "tool" role message
+      - Contains: tool_call_id (matches the original call), content (tool result)
+      - Location: src/agi/agent/agent_loop.py lines 124-128
+
+  3d. Track sources
+      - If tool returned a URL, adds it to sources list
+      - Sources are included in final response
+      - Location: src/agi/agent/agent_loop.py lines 130-137
+
+STEP 4: CHECK LIMITS
+--------------------
+Location: src/agi/agent/agent_loop.py lines 148-154
+
+After each tool execution, agent checks:
+  - If max_pages_fetched (default: 8) reached, adds a user message telling LLM to finish
+  - This prevents excessive API calls
+
+STEP 5: LOOP BACK TO STEP 1
+----------------------------
+The agent goes back to calling the LLM with the updated message history (now includes tool results).
+The LLM sees the tool results and can:
+  - Call more tools if needed
+  - Provide final answer if satisfied
+  - Refine search queries if results weren't good
+
+This continues until:
+  - LLM returns final answer (no tool calls)
+  - Max steps reached (default: 10)
+  - Max pages fetched reached (default: 8)
+
+================================================================================
+4. CONTEXT MANAGEMENT (HOW INFORMATION FLOWS)
+================================================================================
+
+MESSAGE HISTORY STRUCTURE:
+--------------------------
+The message array grows throughout the agent execution:
+
+Initial state (2 messages):
+  [0] {"role": "system", "content": "You are a reliable..."}
+  [1] {"role": "user", "content": "find 55-inch OLED TV"}
+
+After first LLM call (3 messages):
+  [0] {"role": "system", "content": "..."}
+  [1] {"role": "user", "content": "find 55-inch OLED TV"}
+  [2] {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "function": {"name": "search_web", "arguments": "{\"query\": \"55-inch OLED TV\"}"}}]}
+
+After tool execution (4 messages):
+  [0] {"role": "system", "content": "..."}
+  [1] {"role": "user", "content": "find 55-inch OLED TV"}
+  [2] {"role": "assistant", "content": null, "tool_calls": [...]}
+  [3] {"role": "tool", "tool_call_id": "call_1", "content": "Found 5 search results:\n\n- Title 1\n  URL: https://..."}
+
+After second LLM call (5 messages):
+  [0-3] (previous messages)
+  [4] {"role": "assistant", "content": null, "tool_calls": [{"id": "call_2", "function": {"name": "fetch_url", "arguments": "{\"url\": \"https://...\"}"}}]}
+
+And so on...
+
+KEY POINT: The LLM sees the ENTIRE conversation history, including all tool results. This allows it to:
+  - Remember what it already searched for
+  - Build on previous information
+  - Avoid redundant tool calls
+  - Synthesize information from multiple sources
+
+TOOL RESULT FORMATTING:
+-----------------------
+Each tool returns formatted text that the LLM can understand:
+
+search_web result format:
+  "Found 5 search results:\n\n- Title 1\n  URL: https://example.com\n  Snippet text\n- Title 2\n  URL: https://..."
+
+fetch_url result format:
+  "Fetched https://example.com:\n\n[extracted page text, up to 20,000 chars]"
+
+render_url result format:
+  "Rendered https://example.com:\n\n[extracted page text]"
+
+The LLM reads these formatted results and uses them to make decisions.
+
+================================================================================
+5. LLM DECISION MAKING PROCESS
+================================================================================
+
+At each step, the LLM receives:
+  - Full conversation history (all messages so far)
+  - Tool definitions (what tools are available and their parameters)
+  - System prompt (rules about how to behave)
+
+The LLM must decide:
+
+DECISION 1: Do I have enough information?
+  - If YES: Return final answer (no tool_calls)
+  - If NO: Call tools to gather more information
+
+DECISION 2: Which tool should I call?
+  - search_web: When I need to find URLs related to a topic
+  - fetch_url: When I have a URL and need its content
+  - render_url: When fetch_url failed or returned empty (JavaScript-heavy pages)
+
+DECISION 3: What parameters should I use?
+  - For search_web: What query string? How many results?
+  - For fetch_url: Which URL from the search results?
+  - For render_url: Which URL failed to fetch?
+
+DECISION 4: Should I refine my approach?
+  - If search didn't yield good results, try different query
+  - If fetch failed, try render_url
+  - If multiple URLs, prioritize which ones to fetch
+
+The LLM makes these decisions based on:
+  - The system prompt rules (must verify links, etc.)
+  - The conversation history (what it already knows)
+  - The tool results it has seen
+  - Its understanding of the user's intent
+
+================================================================================
+6. FINAL ANSWER GENERATION
+================================================================================
+
+The agent stops when:
+
+CASE A: LLM Returns Final Answer
+---------------------------------
+Location: src/agi/agent/agent_loop.py lines 88-96
+
+The LLM response has no tool_calls field (or empty tool_calls).
+The answer is extracted from message.content.
+Agent returns immediately with:
+  - answer: The LLM's final text response
+  - sources: All URLs that were fetched/rendered during the session
+  - debug: Optional tool execution traces
+
+CASE B: Max Steps Reached
+--------------------------
+Location: src/agi/agent/agent_loop.py lines 156-183
+
+If agent reaches max_steps (default: 10) without final answer:
+  - Tries to extract last assistant message if available
+  - If no message, generates summary from sources found
+  - Returns partial results with note about step limit
+
+CASE C: Max Pages Fetched Reached
+----------------------------------
+Location: src/agi/agent/agent_loop.py lines 148-154
+
+If max_pages_fetched (default: 8) is reached:
+  - Adds user message telling LLM to finish
+  - LLM should provide answer in next iteration
+  - If it doesn't, max_steps will eventually stop it
+
+================================================================================
+7. CACHING AND PERFORMANCE
+================================================================================
+
+All tool results are cached to avoid redundant API calls:
+
+SEARCH CACHE:
+  - Key format: "search:{query}"
+  - TTL: 1 day (86400 seconds)
+  - Location: src/agi/cache/cache.py lines 30-41
+  - If same query is searched again (even in different session), returns cached results
+
+FETCH CACHE:
+  - Key format: "fetch:{url}"
+  - TTL: 7 days (604800 seconds)
+  - Location: src/agi/cache/cache.py lines 44-55
+  - If same URL is fetched again, returns cached content
+
+RENDER CACHE:
+  - Key format: "render:{url}"
+  - TTL: 7 days (604800 seconds)
+  - Location: src/agi/cache/cache.py lines 58-69
+  - If same URL is rendered again, returns cached content
+
+Cache storage: Disk-based using diskcache library
+Cache directory: .cache (configurable via CACHE_DIR env var)
+
+IMPORTANT: Cache is checked BEFORE making API calls. This means:
+  - If LLM searches for same query twice, second call is instant (from cache)
+  - If LLM fetches same URL twice, second call is instant (from cache)
+  - This reduces costs and improves speed
+
+================================================================================
+8. ERROR HANDLING
+================================================================================
+
+LLM API ERRORS:
+---------------
+Location: src/agi/agent/agent_loop.py lines 77-85
+
+If OpenRouter API call fails:
+  - Error is caught and logged
+  - Agent returns error message in answer field
+  - Sources collected so far are still returned
+
+TOOL EXECUTION ERRORS:
+----------------------
+Each tool handles errors gracefully:
+
+search_web errors:
+  - If Brave API fails: Returns error message in tool result
+  - LLM sees the error and can try different query
+  - Location: src/agi/agent/agent_loop.py lines 214-219
+
+fetch_url errors:
+  - If HTTP request fails (404, 403, timeout): Returns error in tool result
+  - Includes status code and error message
+  - LLM sees the error and can try render_url or different URL
+  - Location: src/agi/agent/agent_loop.py lines 260-268
+
+render_url errors:
+  - If Playwright fails (timeout, blocked): Returns error in tool result
+  - LLM sees the error and must work with what it has
+  - Location: src/agi/agent/agent_loop.py lines 305-310
+
+KEY POINT: Errors are returned as tool results, not exceptions. The LLM sees them in the message history and can adapt its strategy.
+
+================================================================================
+9. CONFIGURATION AND LIMITS
+================================================================================
+
+All configuration is in: src/agi/config.py
+
+AGENT LIMITS:
+  DEFAULT_MAX_STEPS = 10
+    - Maximum number of LLM calls (iterations)
+    - Each iteration: LLM call + tool execution
+    - Can be overridden per request via max_steps parameter
+
+  DEFAULT_MAX_PAGES_FETCHED = 8
+    - Maximum number of pages to fetch/render
+    - Prevents excessive API usage
+    - Once reached, LLM is told to finish
+
+  MAX_PAGE_TEXT_LENGTH = 20000
+    - Maximum characters of page text sent to LLM
+    - Prevents context overflow
+    - Text is truncated if longer
+
+CACHE SETTINGS:
+  SEARCH_CACHE_TTL = 86400 (1 day)
+  FETCH_CACHE_TTL = 604800 (7 days)
+  CACHE_DIR = ".cache" (configurable)
+
+API CONFIGURATION:
+  OPENROUTER_API_KEY: Required for LLM calls
+  BRAVE_API_KEY: Required for search
+  OR_MODEL: Model to use (default: google/gemini-2.0-flash)
+
+================================================================================
+10. COMPLETE EXAMPLE WORKFLOW
+================================================================================
+
+User sends: POST /browse {"prompt": "find 55-inch OLED TV in Sofia"}
+
+ITERATION 1:
+  LLM receives: [system prompt, user query]
+  LLM decides: I need to search for this
+  LLM calls: search_web({"query": "55-inch OLED TV Sofia", "count": 5})
+  Tool executes: Calls Brave API, gets 5 results
+  Tool returns: "Found 5 search results: [list of URLs]"
+  Message history now has: [system, user, assistant(tool_call), tool(result)]
+
+ITERATION 2:
+  LLM receives: [all previous messages]
+  LLM sees: I have search results, now I should fetch some URLs
+  LLM calls: fetch_url({"url": "https://technopolis.bg/..."})
+  Tool executes: Fetches page, extracts text
+  Tool returns: "Fetched https://...: [page content]"
+  Message history grows: [previous messages, assistant(tool_call), tool(result)]
+
+ITERATION 3:
+  LLM receives: [all previous messages]
+  LLM sees: I have some info, let me fetch more URLs to compare
+  LLM calls: fetch_url({"url": "https://technomarket.bg/..."})
+  Tool executes: Fetches another page
+  Tool returns: "Fetched https://...: [page content]"
+
+ITERATION 4:
+  LLM receives: [all previous messages]
+  LLM sees: I have enough information from multiple sources
+  LLM decides: I can provide final answer now
+  LLM returns: {"content": "Here are the best 55-inch OLED TVs in Sofia...", "tool_calls": null}
+  Agent stops: Returns answer + sources to user
+
+Total: 4 iterations, 1 search, 2 fetches, 1 final answer
+
+================================================================================
+11. KEY CODE LOCATIONS
+================================================================================
+
+Agent Loop Main Function:
+  src/agi/agent/agent_loop.py lines 37-192
+  Function: AgentLoop.run()
+
+Tool Execution:
+  src/agi/agent/agent_loop.py lines 194-325
+  Function: AgentLoop._execute_tool()
+
+System Prompt:
+  src/agi/agent/agent_loop.py lines 54-78
+
+Tool Definitions:
+  src/agi/agent/tool_schemas.py lines 3-62
+
+OpenRouter Client:
+  src/agi/clients/openrouter_client.py lines 35-80
+  Function: OpenRouterClient.chat()
+
+Brave Search Client:
+  src/agi/clients/brave_client.py lines 30-73
+  Function: BraveClient.search()
+
+Fetch Client:
+  src/agi/clients/fetch_client.py lines 24-108
+  Function: FetchClient.fetch()
+
+Browser Client:
+  src/agi/clients/browser_client.py lines 31-116
+  Function: BrowserClient.render()
+
+HTML Extraction:
+  src/agi/extract/html_extract.py lines 13-54
+  Function: extract_text()
+
+Cache:
+  src/agi/cache/cache.py lines 14-75
+  Functions: get_search(), set_search(), get_fetch(), set_fetch(), get_render(), set_render()
+
+API Endpoint:
+  src/agi/api/main.py lines 55-85
+  Function: browse()
+
+================================================================================
+END OF WORKFLOW DOCUMENTATION
+================================================================================
