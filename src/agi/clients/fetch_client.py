@@ -11,17 +11,33 @@ from ..logging import get_logger
 
 logger = get_logger(__name__)
 
+import httpx
+
+BROWSER_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "uk-UA,uk;q=0.9,ru-RU;q=0.8,ru;q=0.7,en-US;q=0.6,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+
 
 class FetchClient:
-    """Client for fetching web pages via HTTP."""
-
     def __init__(self):
         self.client = httpx.Client(
-            headers={"User-Agent": USER_AGENT},
+            headers=BROWSER_HEADERS,
             timeout=HTTP_TIMEOUT,
             follow_redirects=True,
             max_redirects=HTTP_MAX_REDIRECTS,
+            http2=True,  # important
         )
+
 
     def fetch(self, url: str) -> Dict[str, Any]:
         """
