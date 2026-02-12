@@ -94,7 +94,17 @@ class PlaywrightFetchClient:
         finally:
             self._pw = None
 
-    def fetch(self, url: str, wait_ms: int = 3000) -> Dict[str, Any]:
+    def fetch(self, url: str, wait_ms: int = 1000, wait_until: str = "load") -> Dict[str, Any]:
+        """
+        Fetch a URL using Playwright.
+        
+        Args:
+            url: URL to fetch
+            wait_ms: Additional wait time after page load (default: 1000ms, reduced from 3000ms)
+            wait_until: Wait strategy - "load" (faster, waits for load event), 
+                       "domcontentloaded" (fastest, waits for DOM), 
+                       or "networkidle" (slowest, waits for network idle, use only if needed)
+        """
         self.start()
         t0 = time.time()
         page = self._ctx.new_page()
@@ -110,21 +120,27 @@ class PlaywrightFetchClient:
         error: Optional[str] = None
 
         try:
-            resp = page.goto(url, wait_until="networkidle", timeout=self.nav_timeout_ms)
+            # Use faster wait strategy by default (load event instead of networkidle)
+            # networkidle can take 10-30+ seconds on pages with many requests
+            resp = page.goto(url, wait_until=wait_until, timeout=self.nav_timeout_ms)
             if resp is not None:
                 status = resp.status
                 headers = {k.lower(): v for k, v in resp.headers.items()}
             final_url = page.url
 
-            page.wait_for_timeout(wait_ms)
+            # Reduced wait time - most JS renders within 1 second
+            if wait_ms > 0:
+                page.wait_for_timeout(wait_ms)
+            
             html = page.content()
             title = page.title()
 
             # If CF challenge detected, wait longer and re-check once
             if looks_like_cf(html, final_url):
-                page.wait_for_timeout(8000)
+                page.wait_for_timeout(5000)  # Reduced from 8000ms
                 try:
-                    page.wait_for_load_state("networkidle", timeout=15_000)
+                    # Only wait for load state, not networkidle (faster)
+                    page.wait_for_load_state("load", timeout=10_000)
                 except Exception:
                     pass
                 final_url = page.url
@@ -155,16 +171,23 @@ class PlaywrightFetchClient:
 
 
 if __name__ == "__main__":
-    url = 'https://sovajewels.com/catalog/koltsa/koltso-iz-belogo-zolota-i-keramiki-smart-beautiful-artikul-110474820202.html'
+
+    '''
+    найди 5 максимально похожих товаров на этот:  https://sovajewels.com/ua/p/koltso-iz-belogo-zolota-i-keramiki-smart-beautiful-artikul-110474820202/
+только на сайте этой компании: https://zolotiyvik.ua/ua/
+
+    '''
+    # url = 'https://sovajewels.com/catalog/koltsa/koltso-iz-belogo-zolota-i-keramiki-smart-beautiful-artikul-110474820202.html'
+    url = 'https://zolotiyvik.ua/ua/'
     pc = ProxyConfig(server="http://gate.decodo.com:10001", username="sp9tlfl8r5", password="Xsuok87G~1bd3TouSp")
 
     # seed = PlaywrightFetchClient(headless=False, user_data_dir=".pw_sova", proxy=pc)
-    seed = PlaywrightFetchClient(headless=False, user_data_dir=".pw_sova")
+    seed = PlaywrightFetchClient(headless=False, user_data_dir=".pw_zolotiyvik")
     res = seed.fetch(url)
     print(res["status"], res["blocked"], res["final_url"])
     if res.get("html"):
-        with open("debug_sova_seed.html", "w", encoding="utf-8") as f:
+        with open("debug_zolotiyvik_seed.html", "w", encoding="utf-8") as f:
             f.write(res["html"])
-        print("Saved HTML to debug_sova_seed.html")
+        print("Saved HTML to debug_zolotiyvik_seed.html")
 
     seed.close()
